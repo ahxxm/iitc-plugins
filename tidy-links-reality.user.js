@@ -2,7 +2,7 @@
 // @author         boombuler
 // @name           IITC plugin: Tidy Links Reality
 // @category       Draw
-// @version        0.6.4
+// @version        0.7.2
 // @description    Calculate how to link the portals to create a reasonably tidy set of links/fields. Enable from the layer chooser. (former `Max Links`)
 // @id             tidy-links-reality
 // @namespace      https://github.com/IITC-CE/ingress-intel-total-conversion
@@ -27,6 +27,13 @@ plugin_info.pluginId = 'tidy-links-reality';
 /* global L -- eslint */
 
 var changelog = [
+  {
+    version: '0.7.0',
+    changes: [
+      'Respect existing in-game links: never propose a link that crosses or duplicates one. ' +
+      'Replace Delaunay with greedy shortest-edge insertion against existing links and earlier accepted candidates.',
+    ],
+  },
   { version: '0.6.4', changes: ['Fix missing library object reference'] },
   {
     version: '0.6.3',
@@ -45,6 +52,22 @@ var changelog = [
 // use own namespace for plugin
 var tidyLinksReality = {};
 window.plugin.tidyLinksReality = tidyLinksReality;
+
+tidyLinksReality.VERSION = '0.7.2';
+
+tidyLinksReality.setStatus = function (text) {
+  var el = document.getElementById('tidy-links-reality-status');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'tidy-links-reality-status';
+    el.style.cssText =
+      'position:fixed;right:8px;bottom:8px;z-index:5000;' +
+      'padding:4px 8px;background:rgba(0,0,0,0.7);color:#fff;' +
+      'font:12px/1.3 monospace;border-radius:4px;pointer-events:none;max-width:60vw;';
+    document.body.appendChild(el);
+  }
+  el.textContent = 'tidy-links-reality v' + tidyLinksReality.VERSION + ' | ' + text;
+};
 
 tidyLinksReality.MAX_PORTALS_TO_LINK = 200; // N.B.: this limit is not about performance
 
@@ -96,43 +119,91 @@ tidyLinksReality.getLocations = function (limit) {
   return locationsArray;
 };
 
-tidyLinksReality.draw = function (locations, layer) {
-  var triangles = tidyLinksReality.Delaunay.triangulate(
-    locations.map(function (location) {
-      return [location._point.x, location._point.y];
-    })
-  );
+// Returns sign of the 2D cross product (b-a) x (c-a). Positive = c is left of a->b.
+function ccw(ax, ay, bx, by, cx, cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
 
-  var drawnLinks = {};
+// Strict (open) segment crossing in pixel space. Shared endpoints (by GUID or pixel proximity) are not crossings.
+function segmentsCross(s, t) {
+  if (s.aId && (s.aId === t.aId || s.aId === t.bId)) return false;
+  if (s.bId && (s.bId === t.aId || s.bId === t.bId)) return false;
+  var EPS = 0.5;
+  function near(p, q) { return Math.abs(p[0] - q[0]) < EPS && Math.abs(p[1] - q[1]) < EPS; }
+  if (near(s.a, t.a) || near(s.a, t.b) || near(s.b, t.a) || near(s.b, t.b)) return false;
+  var d1 = ccw(t.a[0], t.a[1], t.b[0], t.b[1], s.a[0], s.a[1]);
+  var d2 = ccw(t.a[0], t.a[1], t.b[0], t.b[1], s.b[0], s.b[1]);
+  var d3 = ccw(s.a[0], s.a[1], s.b[0], s.b[1], t.a[0], t.a[1]);
+  var d4 = ccw(s.a[0], s.a[1], s.b[0], s.b[1], t.b[0], t.b[1]);
+  return d1 * d2 < 0 && d3 * d4 < 0;
+}
 
-  // draw a link, but only if it hasn't already been drawn
-  function drawLink(a, b) {
-    // order the points, so a pair of coordinates in any order is handled in one direction only
-    if (a > b) {
-      b = [a, (a = b)][0]; // swap
+// Collect every live game link as a constraint edge in current-zoom pixel space, plus a GUID-pair set for dedup.
+// link.getLatLngs() returns [fromLatLng, toLatLng] for IITC link layers (see cross-links plugin).
+tidyLinksReality.collectExistingLinks = function () {
+  var edges = [];
+  var pairs = {};
+  var n = 0;
+  for (var guid in window.links) {
+    var link = window.links[guid];
+    var lls = link.getLatLngs();
+    if (!lls || lls.length < 2) continue;
+    var ap = map.latLngToLayerPoint(lls[0]);
+    var bp = map.latLngToLayerPoint(lls[1]);
+    var data = (link.options && link.options.data) || {};
+    var aId = data.oGuid || null;
+    var bId = data.dGuid || null;
+    edges.push({ a: [ap.x, ap.y], b: [bp.x, bp.y], aId: aId, bId: bId });
+    if (aId && bId) {
+      pairs[aId < bId ? aId + '|' + bId : bId + '|' + aId] = true;
     }
+    n++;
+  }
+  return { edges: edges, pairs: pairs };
+};
 
-    if (!(a in drawnLinks)) {
-      // no lines from a to anywhere yet
-      drawnLinks[a] = {};
-    }
+// Returns the number of accepted (drawn) candidate edges.
+tidyLinksReality.draw = function (locations, layer, existing) {
+  var drawnCount = 0;
+  var n = locations.length;
+  var pts = new Array(n);
+  var ids = new Array(n);
+  for (var i = 0; i < n; i++) {
+    pts[i] = [locations[i]._point.x, locations[i]._point.y];
+    ids[i] = (locations[i].options && locations[i].options.guid) || null;
+  }
 
-    if (!(b in drawnLinks[a])) {
-      // no line from a to b yet
-      drawnLinks[a][b] = true;
-      var aLL = locations[a].getLatLng();
-      var bLL = locations[b].getLatLng();
-      L.polyline([aLL, bLL], tidyLinksReality.STROKE_STYLE).addTo(layer);
+  var candidates = [];
+  for (var u = 0; u < n; u++) {
+    for (var v = u + 1; v < n; v++) {
+      var dx = pts[u][0] - pts[v][0];
+      var dy = pts[u][1] - pts[v][1];
+      candidates.push([dx * dx + dy * dy, u, v]);
     }
   }
-  for (var i = 0; i < triangles.length; ) {
-    var a = triangles[i++],
-      b = triangles[i++],
-      c = triangles[i++];
-    drawLink(a, b);
-    drawLink(b, c);
-    drawLink(c, a);
+  candidates.sort(function (x, y) { return x[0] - y[0]; });
+
+  var accepted = existing.edges.slice();
+  for (var k = 0; k < candidates.length; k++) {
+    var iu = candidates[k][1];
+    var iv = candidates[k][2];
+    var aId = ids[iu];
+    var bId = ids[iv];
+    if (aId && bId) {
+      var key = aId < bId ? aId + '|' + bId : bId + '|' + aId;
+      if (existing.pairs[key]) continue;
+    }
+    var seg = { a: pts[iu], b: pts[iv], aId: aId, bId: bId };
+    var crosses = false;
+    for (var m = 0; m < accepted.length; m++) {
+      if (segmentsCross(seg, accepted[m])) { crosses = true; break; }
+    }
+    if (crosses) continue;
+    accepted.push(seg);
+    L.polyline([locations[iu].getLatLng(), locations[iv].getLatLng()], tidyLinksReality.STROKE_STYLE).addTo(layer);
+    drawnCount++;
   }
+  return drawnCount;
 };
 
 tidyLinksReality.setOverflow = function (isOveflowed) {
@@ -141,18 +212,24 @@ tidyLinksReality.setOverflow = function (isOveflowed) {
 
 tidyLinksReality.update = function () {
   var locationsArray = tidyLinksReality.getLocations();
+  var totalPortals = locationsArray.reduce(function (s, a) { return s + a.length; }, 0);
   if (locationsArray.length) {
     tidyLinksReality.layer.clearLayers();
+    var existing = tidyLinksReality.collectExistingLinks();
+    var accepted = 0;
     locationsArray.forEach(function (locations) {
-      tidyLinksReality.draw(locations, tidyLinksReality.layer);
+      accepted += tidyLinksReality.draw(locations, tidyLinksReality.layer, existing);
     });
+    tidyLinksReality.setStatus(
+      'portals=' + totalPortals + ' existing=' + existing.edges.length + ' drawn=' + accepted
+    );
+  } else {
+    tidyLinksReality.setStatus('portals=0 (no portals in view)');
   }
   tidyLinksReality.setOverflow(!locationsArray.length);
 };
 
 function setup() {
-  tidyLinksReality.Delaunay = loadDelaunay();
-
   map = window.map;
   tidyLinksReality.layer = new L.LayerGroup([])
     .on('add', function () {
@@ -177,7 +254,7 @@ function setup() {
     return map.getCenter();
   };
 
-  window.layerChooser.addOverlay(tidyLinksReality.layer, 'Tidy Links Reality', { default: false });
+  window.layerChooser.addOverlay(tidyLinksReality.layer, 'Tidy Links Reality v' + tidyLinksReality.VERSION, { default: false });
 
   $('<style>')
     .html(
@@ -197,228 +274,6 @@ function setup() {
     .appendTo('head');
 }
 
-function loadDelaunay() {
-  try {
-    // https://github.com/ironwallaby/delaunay
-    var Delaunay;
-
-    (function () {
-      'use strict';
-
-      var EPSILON = 1.0 / 1048576.0;
-
-      function supertriangle(vertices) {
-        var xmin = Number.POSITIVE_INFINITY,
-          ymin = Number.POSITIVE_INFINITY,
-          xmax = Number.NEGATIVE_INFINITY,
-          ymax = Number.NEGATIVE_INFINITY,
-          i,
-          dx,
-          dy,
-          dmax,
-          xmid,
-          ymid;
-
-        for (i = vertices.length; i--; ) {
-          if (vertices[i][0] < xmin) xmin = vertices[i][0];
-          if (vertices[i][0] > xmax) xmax = vertices[i][0];
-          if (vertices[i][1] < ymin) ymin = vertices[i][1];
-          if (vertices[i][1] > ymax) ymax = vertices[i][1];
-        }
-
-        dx = xmax - xmin;
-        dy = ymax - ymin;
-        dmax = Math.max(dx, dy);
-        xmid = xmin + dx * 0.5;
-        ymid = ymin + dy * 0.5;
-
-        return [
-          [xmid - 20 * dmax, ymid - dmax],
-          [xmid, ymid + 20 * dmax],
-          [xmid + 20 * dmax, ymid - dmax],
-        ];
-      }
-
-      function circumcircle(vertices, i, j, k) {
-        var x1 = vertices[i][0],
-          y1 = vertices[i][1],
-          x2 = vertices[j][0],
-          y2 = vertices[j][1],
-          x3 = vertices[k][0],
-          y3 = vertices[k][1],
-          fabsy1y2 = Math.abs(y1 - y2),
-          fabsy2y3 = Math.abs(y2 - y3),
-          xc,
-          yc,
-          m1,
-          m2,
-          mx1,
-          mx2,
-          my1,
-          my2,
-          dx,
-          dy;
-
-        if (fabsy1y2 < EPSILON && fabsy2y3 < EPSILON) throw new Error('Eek! Coincident points!');
-
-        if (fabsy1y2 < EPSILON) {
-          m2 = -((x3 - x2) / (y3 - y2));
-          mx2 = (x2 + x3) / 2.0;
-          my2 = (y2 + y3) / 2.0;
-          xc = (x2 + x1) / 2.0;
-          yc = m2 * (xc - mx2) + my2;
-        } else if (fabsy2y3 < EPSILON) {
-          m1 = -((x2 - x1) / (y2 - y1));
-          mx1 = (x1 + x2) / 2.0;
-          my1 = (y1 + y2) / 2.0;
-          xc = (x3 + x2) / 2.0;
-          yc = m1 * (xc - mx1) + my1;
-        } else {
-          m1 = -((x2 - x1) / (y2 - y1));
-          m2 = -((x3 - x2) / (y3 - y2));
-          mx1 = (x1 + x2) / 2.0;
-          mx2 = (x2 + x3) / 2.0;
-          my1 = (y1 + y2) / 2.0;
-          my2 = (y2 + y3) / 2.0;
-          xc = (m1 * mx1 - m2 * mx2 + my2 - my1) / (m1 - m2);
-          yc = fabsy1y2 > fabsy2y3 ? m1 * (xc - mx1) + my1 : m2 * (xc - mx2) + my2;
-        }
-
-        dx = x2 - xc;
-        dy = y2 - yc;
-        return { i: i, j: j, k: k, x: xc, y: yc, r: dx * dx + dy * dy };
-      }
-
-      function dedup(edges) {
-        var i, j, a, b, m, n;
-
-        for (j = edges.length; j; ) {
-          b = edges[--j];
-          a = edges[--j];
-
-          for (i = j; i; ) {
-            n = edges[--i];
-            m = edges[--i];
-
-            if ((a === m && b === n) || (a === n && b === m)) {
-              edges.splice(j, 2);
-              edges.splice(i, 2);
-              break;
-            }
-          }
-        }
-      }
-
-      Delaunay = {
-        triangulate: function (vertices, key) {
-          var n = vertices.length,
-            i,
-            j,
-            indices,
-            st,
-            open,
-            closed,
-            edges,
-            dx,
-            dy,
-            a,
-            b,
-            c;
-
-          if (n < 3) return [];
-
-          vertices = vertices.slice(0);
-
-          if (key) for (i = n; i--; ) vertices[i] = vertices[i][key];
-
-          indices = new Array(n);
-
-          for (i = n; i--; ) indices[i] = i;
-
-          indices.sort(function (i, j) {
-            var diff = vertices[j][0] - vertices[i][0];
-            return diff !== 0 ? diff : i - j;
-          });
-
-          st = supertriangle(vertices);
-          vertices.push(st[0], st[1], st[2]);
-
-          open = [circumcircle(vertices, n + 0, n + 1, n + 2)];
-          closed = [];
-          edges = [];
-
-          for (i = indices.length; i--; edges.length = 0) {
-            c = indices[i];
-
-            for (j = open.length; j--; ) {
-              dx = vertices[c][0] - open[j].x;
-              if (dx > 0.0 && dx * dx > open[j].r) {
-                closed.push(open[j]);
-                open.splice(j, 1);
-                continue;
-              }
-
-              dy = vertices[c][1] - open[j].y;
-              if (dx * dx + dy * dy - open[j].r > EPSILON) continue;
-
-              edges.push(open[j].i, open[j].j, open[j].j, open[j].k, open[j].k, open[j].i);
-              open.splice(j, 1);
-            }
-
-            dedup(edges);
-
-            for (j = edges.length; j; ) {
-              b = edges[--j];
-              a = edges[--j];
-              open.push(circumcircle(vertices, a, b, c));
-            }
-          }
-
-          for (i = open.length; i--; ) closed.push(open[i]);
-          open.length = 0;
-
-          for (i = closed.length; i--; )
-            if (closed[i].i < n && closed[i].j < n && closed[i].k < n) open.push(closed[i].i, closed[i].j, closed[i].k);
-
-          return open;
-        },
-        contains: function (tri, p) {
-          if (
-            (p[0] < tri[0][0] && p[0] < tri[1][0] && p[0] < tri[2][0]) ||
-            (p[0] > tri[0][0] && p[0] > tri[1][0] && p[0] > tri[2][0]) ||
-            (p[1] < tri[0][1] && p[1] < tri[1][1] && p[1] < tri[2][1]) ||
-            (p[1] > tri[0][1] && p[1] > tri[1][1] && p[1] > tri[2][1])
-          )
-            return null;
-
-          var a = tri[1][0] - tri[0][0],
-            b = tri[2][0] - tri[0][0],
-            c = tri[1][1] - tri[0][1],
-            d = tri[2][1] - tri[0][1],
-            i = a * d - b * c;
-
-          if (i === 0.0) return null;
-
-          var u = (d * (p[0] - tri[0][0]) - b * (p[1] - tri[0][1])) / i,
-            v = (a * (p[1] - tri[0][1]) - c * (p[0] - tri[0][0])) / i;
-
-          if (u < 0.0 || v < 0.0 || u + v > 1.0) return null;
-
-          return [u, v];
-        },
-      };
-    })();
-
-    if (typeof window.Delaunay === 'undefined') {
-      window.Delaunay = Delaunay;
-    }
-
-    return window.Delaunay;
-  } catch (e) {
-    console.error('delaunay.js loading failed');
-    throw e;
-  }
-}
 
 setup.info = plugin_info; //add the script info data to the function as a property
 if (typeof changelog !== 'undefined') setup.info.changelog = changelog;
