@@ -206,15 +206,18 @@ tidyLinksReality.collectExistingLinks = function () {
   return { edges: edges, pairs: pairs };
 };
 
-// Returns { drawn, directed, skipped } counts.
+// Returns { drawn, forced, preferred, skipped } counts. Every accepted candidate
+// gets one arrowhead (uniform style); direction is the walking-route recommendation.
 tidyLinksReality.draw = function (locations, layer, existing, usedOutgoing) {
   var drawnCount = 0;
-  var directedCount = 0;
+  var forcedCount = 0;
+  var preferredCount = 0;
   var skippedSaturated = 0;
   var n = locations.length;
   var pts = new Array(n);
   var ids = new Array(n);
-  var free = new Array(n); // remaining outgoing capacity per local index
+  var free = new Array(n);     // remaining outgoing capacity per local index
+  var assigned = new Array(n); // new outgoing committed this batch (for load-spreading)
   // Project at PROJECT_ZOOM with map.project (unrounded). Reading locations[i]._point
   // or using latLngToLayerPoint both round to integer pixels, which can snap a
   // near-collinear portal exactly onto an existing link's line and defeat the ccw test.
@@ -227,6 +230,7 @@ tidyLinksReality.draw = function (locations, layer, existing, usedOutgoing) {
     var cap = tidyLinksReality.getOutgoingCap(locations[i]);
     var used = (gid && usedOutgoing[gid]) || 0;
     free[i] = Math.max(0, cap - used);
+    assigned[i] = 0;
   }
 
   var candidates = [];
@@ -256,34 +260,44 @@ tidyLinksReality.draw = function (locations, layer, existing, usedOutgoing) {
     }
     if (crosses) continue;
 
-    // Direction by remaining outgoing capacity. Show arrow only when one side is
-    // forced because the other has 0 free outgoing slots.
     var fu = free[iu], fv = free[iv];
     if (fu === 0 && fv === 0) {
       skippedSaturated++;
       continue;
     }
-    accepted.push(seg);
-    var fromLL, toLL, arrowed;
-    if (fu >= fv) {
-      fromLL = locations[iu].getLatLng();
-      toLL = locations[iv].getLatLng();
-      free[iu]--;
-      arrowed = fv === 0;
+
+    // Origin choice:
+    //   - if exactly one side has free=0, the other is forced.
+    //   - otherwise, prefer the side with FEWER outgoing already assigned this batch
+    //     (spreads key load across portals); tiebreak by larger free; final tie by index.
+    var origin;
+    var forced = false;
+    if (fv === 0) {
+      origin = iu;
+      forced = true;
+    } else if (fu === 0) {
+      origin = iv;
+      forced = true;
+    } else if (assigned[iu] !== assigned[iv]) {
+      origin = assigned[iu] < assigned[iv] ? iu : iv;
+    } else if (fu !== fv) {
+      origin = fu > fv ? iu : iv;
     } else {
-      fromLL = locations[iv].getLatLng();
-      toLL = locations[iu].getLatLng();
-      free[iv]--;
-      arrowed = fu === 0;
+      origin = iu;
     }
+    var dest = origin === iu ? iv : iu;
+
+    accepted.push(seg);
+    var fromLL = locations[origin].getLatLng();
+    var toLL = locations[dest].getLatLng();
     L.polyline([fromLL, toLL], tidyLinksReality.STROKE_STYLE).addTo(layer);
-    if (arrowed) {
-      tidyLinksReality.drawArrowHead(fromLL, toLL, layer);
-      directedCount++;
-    }
+    tidyLinksReality.drawArrowHead(fromLL, toLL, layer);
+    free[origin]--;
+    assigned[origin]++;
     drawnCount++;
+    if (forced) forcedCount++; else preferredCount++;
   }
-  return { drawn: drawnCount, directed: directedCount, skipped: skippedSaturated };
+  return { drawn: drawnCount, forced: forcedCount, preferred: preferredCount, skipped: skippedSaturated };
 };
 
 tidyLinksReality.setOverflow = function (isOveflowed) {
@@ -297,16 +311,17 @@ tidyLinksReality.update = function () {
     tidyLinksReality.layer.clearLayers();
     var existing = tidyLinksReality.collectExistingLinks();
     var used = tidyLinksReality.getUsedOutgoing();
-    var totals = { drawn: 0, directed: 0, skipped: 0 };
+    var totals = { drawn: 0, forced: 0, preferred: 0, skipped: 0 };
     locationsArray.forEach(function (locations) {
       var r = tidyLinksReality.draw(locations, tidyLinksReality.layer, existing, used);
       totals.drawn += r.drawn;
-      totals.directed += r.directed;
+      totals.forced += r.forced;
+      totals.preferred += r.preferred;
       totals.skipped += r.skipped;
     });
     tidyLinksReality.setStatus(
       'portals=' + totalPortals + ' existing=' + existing.edges.length +
-      ' drawn=' + totals.drawn + ' (' + totals.directed + ' arrowed) skipped=' + totals.skipped
+      ' drawn=' + totals.drawn + ' (' + totals.forced + ' forced, ' + totals.preferred + ' preferred) skipped=' + totals.skipped
     );
   } else {
     tidyLinksReality.setStatus('portals=0 (no portals in view)');
