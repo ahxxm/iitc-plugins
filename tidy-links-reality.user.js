@@ -138,18 +138,20 @@ function segmentsCross(s, t) {
   return d1 * d2 < 0 && d3 * d4 < 0;
 }
 
-// Collect every live game link as a constraint edge in current-zoom pixel space, plus a GUID-pair set for dedup.
+// Collect every live game link as a constraint edge in unrounded pixel space at PROJECT_ZOOM.
 // link.getLatLngs() returns [fromLatLng, toLatLng] for IITC link layers (see cross-links plugin).
+// Use map.project(ll, zoom) NOT latLngToLayerPoint(ll) — the latter calls ._round() inside Leaflet,
+// which can snap near-collinear portals onto an existing link's line and defeat the ccw test.
 tidyLinksReality.collectExistingLinks = function () {
   var edges = [];
   var pairs = {};
-  var n = 0;
+  var z = tidyLinksReality.PROJECT_ZOOM;
   for (var guid in window.links) {
     var link = window.links[guid];
     var lls = link.getLatLngs();
     if (!lls || lls.length < 2) continue;
-    var ap = map.latLngToLayerPoint(lls[0]);
-    var bp = map.latLngToLayerPoint(lls[1]);
+    var ap = map.project(lls[0], z);
+    var bp = map.project(lls[1], z);
     var data = (link.options && link.options.data) || {};
     var aId = data.oGuid || null;
     var bId = data.dGuid || null;
@@ -157,7 +159,6 @@ tidyLinksReality.collectExistingLinks = function () {
     if (aId && bId) {
       pairs[aId < bId ? aId + '|' + bId : bId + '|' + aId] = true;
     }
-    n++;
   }
   return { edges: edges, pairs: pairs };
 };
@@ -168,8 +169,13 @@ tidyLinksReality.draw = function (locations, layer, existing) {
   var n = locations.length;
   var pts = new Array(n);
   var ids = new Array(n);
+  // Project at PROJECT_ZOOM with map.project (unrounded). Reading locations[i]._point
+  // or using latLngToLayerPoint both round to integer pixels, which can snap a
+  // near-collinear portal exactly onto an existing link's line and defeat the ccw test.
+  var z = tidyLinksReality.PROJECT_ZOOM;
   for (var i = 0; i < n; i++) {
-    pts[i] = [locations[i]._point.x, locations[i]._point.y];
+    var p = map.project(locations[i].getLatLng(), z);
+    pts[i] = [p.x, p.y];
     ids[i] = (locations[i].options && locations[i].options.guid) || null;
   }
 
