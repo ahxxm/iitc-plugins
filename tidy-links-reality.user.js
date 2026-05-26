@@ -138,6 +138,49 @@ function segmentsCross(s, t) {
   return d1 * d2 < 0 && d3 * d4 < 0;
 }
 
+// Outgoing-link capacity per Ingress rules: 8 base, +8 per SoftBank Ultra Link mod (stackable).
+// Mod data is only populated after IITC fetches portal detail; unknown -> assume base 8.
+tidyLinksReality.getOutgoingCap = function (portal) {
+  var cap = 8;
+  var data = portal && portal.options && portal.options.data;
+  var mods = data && data.mods;
+  if (!mods) return cap;
+  for (var i = 0; i < mods.length; i++) {
+    var mod = mods[i];
+    if (mod && mod.stats && mod.stats.OUTGOING_LINKS_BONUS) {
+      cap += parseInt(mod.stats.OUTGOING_LINKS_BONUS, 10) || 0;
+    }
+  }
+  return cap;
+};
+
+// Count current outgoing links per portal guid by scanning window.links (origin side).
+tidyLinksReality.getUsedOutgoing = function () {
+  var used = {};
+  for (var guid in window.links) {
+    var data = window.links[guid].options && window.links[guid].options.data;
+    if (data && data.oGuid) used[data.oGuid] = (used[data.oGuid] || 0) + 1;
+  }
+  return used;
+};
+
+// Draw an arrowhead (open V) at toLL pointing along fromLL->toLL. Solid red, no dash.
+tidyLinksReality.drawArrowHead = function (fromLL, toLL, layer) {
+  var fp = map.latLngToLayerPoint(fromLL);
+  var tp = map.latLngToLayerPoint(toLL);
+  var dx = tp.x - fp.x, dy = tp.y - fp.y;
+  var len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1) return;
+  var ux = dx / len, uy = dy / len;
+  var ARROW_LEN = 10, ARROW_HALF = 5;
+  var b1 = L.point(tp.x - ARROW_LEN * ux + ARROW_HALF * -uy, tp.y - ARROW_LEN * uy + ARROW_HALF * ux);
+  var b2 = L.point(tp.x - ARROW_LEN * ux - ARROW_HALF * -uy, tp.y - ARROW_LEN * uy - ARROW_HALF * ux);
+  L.polyline(
+    [map.layerPointToLatLng(b1), toLL, map.layerPointToLatLng(b2)],
+    { color: 'red', opacity: 1, weight: 1.5, interactive: false }
+  ).addTo(layer);
+};
+
 // Collect every live game link as a constraint edge in unrounded pixel space at PROJECT_ZOOM.
 // link.getLatLngs() returns [fromLatLng, toLatLng] for IITC link layers (see cross-links plugin).
 // Use map.project(ll, zoom) NOT latLngToLayerPoint(ll) — the latter calls ._round() inside Leaflet,
@@ -163,12 +206,15 @@ tidyLinksReality.collectExistingLinks = function () {
   return { edges: edges, pairs: pairs };
 };
 
-// Returns the number of accepted (drawn) candidate edges.
-tidyLinksReality.draw = function (locations, layer, existing) {
+// Returns { drawn, directed, skipped } counts.
+tidyLinksReality.draw = function (locations, layer, existing, usedOutgoing) {
   var drawnCount = 0;
+  var directedCount = 0;
+  var skippedSaturated = 0;
   var n = locations.length;
   var pts = new Array(n);
   var ids = new Array(n);
+  var free = new Array(n); // remaining outgoing capacity per local index
   // Project at PROJECT_ZOOM with map.project (unrounded). Reading locations[i]._point
   // or using latLngToLayerPoint both round to integer pixels, which can snap a
   // near-collinear portal exactly onto an existing link's line and defeat the ccw test.
@@ -176,7 +222,11 @@ tidyLinksReality.draw = function (locations, layer, existing) {
   for (var i = 0; i < n; i++) {
     var p = map.project(locations[i].getLatLng(), z);
     pts[i] = [p.x, p.y];
-    ids[i] = (locations[i].options && locations[i].options.guid) || null;
+    var gid = (locations[i].options && locations[i].options.guid) || null;
+    ids[i] = gid;
+    var cap = tidyLinksReality.getOutgoingCap(locations[i]);
+    var used = (gid && usedOutgoing[gid]) || 0;
+    free[i] = Math.max(0, cap - used);
   }
 
   var candidates = [];
@@ -205,11 +255,35 @@ tidyLinksReality.draw = function (locations, layer, existing) {
       if (segmentsCross(seg, accepted[m])) { crosses = true; break; }
     }
     if (crosses) continue;
+
+    // Direction by remaining outgoing capacity. Show arrow only when one side is
+    // forced because the other has 0 free outgoing slots.
+    var fu = free[iu], fv = free[iv];
+    if (fu === 0 && fv === 0) {
+      skippedSaturated++;
+      continue;
+    }
     accepted.push(seg);
-    L.polyline([locations[iu].getLatLng(), locations[iv].getLatLng()], tidyLinksReality.STROKE_STYLE).addTo(layer);
+    var fromLL, toLL, arrowed;
+    if (fu >= fv) {
+      fromLL = locations[iu].getLatLng();
+      toLL = locations[iv].getLatLng();
+      free[iu]--;
+      arrowed = fv === 0;
+    } else {
+      fromLL = locations[iv].getLatLng();
+      toLL = locations[iu].getLatLng();
+      free[iv]--;
+      arrowed = fu === 0;
+    }
+    L.polyline([fromLL, toLL], tidyLinksReality.STROKE_STYLE).addTo(layer);
+    if (arrowed) {
+      tidyLinksReality.drawArrowHead(fromLL, toLL, layer);
+      directedCount++;
+    }
     drawnCount++;
   }
-  return drawnCount;
+  return { drawn: drawnCount, directed: directedCount, skipped: skippedSaturated };
 };
 
 tidyLinksReality.setOverflow = function (isOveflowed) {
@@ -222,12 +296,17 @@ tidyLinksReality.update = function () {
   if (locationsArray.length) {
     tidyLinksReality.layer.clearLayers();
     var existing = tidyLinksReality.collectExistingLinks();
-    var accepted = 0;
+    var used = tidyLinksReality.getUsedOutgoing();
+    var totals = { drawn: 0, directed: 0, skipped: 0 };
     locationsArray.forEach(function (locations) {
-      accepted += tidyLinksReality.draw(locations, tidyLinksReality.layer, existing);
+      var r = tidyLinksReality.draw(locations, tidyLinksReality.layer, existing, used);
+      totals.drawn += r.drawn;
+      totals.directed += r.directed;
+      totals.skipped += r.skipped;
     });
     tidyLinksReality.setStatus(
-      'portals=' + totalPortals + ' existing=' + existing.edges.length + ' drawn=' + accepted
+      'portals=' + totalPortals + ' existing=' + existing.edges.length +
+      ' drawn=' + totals.drawn + ' (' + totals.directed + ' arrowed) skipped=' + totals.skipped
     );
   } else {
     tidyLinksReality.setStatus('portals=0 (no portals in view)');
@@ -237,18 +316,33 @@ tidyLinksReality.update = function () {
 
 function setup() {
   map = window.map;
+
+  // Coalesce bursts of triggers (zoom emits moveend, mapDataRefreshEnd fires after tile fetch).
+  var pendingTimer = null;
+  tidyLinksReality.scheduleUpdate = function () {
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(function () {
+      pendingTimer = null;
+      tidyLinksReality.update();
+    }, 200);
+  };
+
   tidyLinksReality.layer = new L.LayerGroup([])
     .on('add', function () {
       tidyLinksReality.update();
-      window.addHook('mapDataRefreshEnd', tidyLinksReality.update);
+      window.addHook('mapDataRefreshEnd', tidyLinksReality.scheduleUpdate);
+      window.addHook('portalDetailLoaded', tidyLinksReality.scheduleUpdate);
+      map.on('moveend', tidyLinksReality.scheduleUpdate);
       if (window.plugin.drawTools && window.plugin.drawTools.filterEvents) {
-        window.plugin.drawTools.filterEvents.on('changed', tidyLinksReality.update);
+        window.plugin.drawTools.filterEvents.on('changed', tidyLinksReality.scheduleUpdate);
       }
     })
     .on('remove', function () {
-      window.removeHook('mapDataRefreshEnd', tidyLinksReality.update);
+      window.removeHook('mapDataRefreshEnd', tidyLinksReality.scheduleUpdate);
+      window.removeHook('portalDetailLoaded', tidyLinksReality.scheduleUpdate);
+      map.off('moveend', tidyLinksReality.scheduleUpdate);
       if (window.plugin.drawTools && window.plugin.drawTools.filterEvents) {
-        window.plugin.drawTools.filterEvents.off('changed', tidyLinksReality.update);
+        window.plugin.drawTools.filterEvents.off('changed', tidyLinksReality.scheduleUpdate);
       }
     })
     .bindTooltip('Tidy Links Reality: too many portals!', {
