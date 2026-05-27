@@ -32,6 +32,9 @@ apTargets.AP_PER_LINK = 187;
 apTargets.AP_PER_FIELD = 750;
 apTargets.STORAGE_KEY = 'ap-targets-my-team';
 
+apTargets._lastResult = null;
+apTargets._dialogOpen = false;
+
 var map;
 
 apTargets.normalizeTeam = function (t) {
@@ -65,23 +68,10 @@ apTargets.getMyTeam = function () {
   return null;
 };
 
-apTargets.setStatus = function (lines) {
-  var el = document.getElementById('ap-targets-status');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'ap-targets-status';
-    el.style.cssText =
-      'position:fixed;left:8px;bottom:8px;z-index:5000;' +
-      'padding:6px 10px;background:rgba(0,0,0,0.75);color:#fff;' +
-      'font:12px/1.4 monospace;border-radius:4px;pointer-events:none;max-width:60vw;white-space:pre;';
-    document.body.appendChild(el);
-  }
-  el.textContent = lines.join('\n');
-};
-
-apTargets.removeStatus = function () {
-  var el = document.getElementById('ap-targets-status');
-  if (el) el.parentNode.removeChild(el);
+apTargets.escapeHtml = function (s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
 };
 
 apTargets.makeBadge = function (rank, ap) {
@@ -145,6 +135,7 @@ apTargets.rank = function (myTeam) {
       fields: fc,
       team: team,
       title: pd.title || apTargets.coordLabel(ll),
+      hasTitle: !!pd.title,
       latLng: ll,
     });
   }
@@ -152,38 +143,86 @@ apTargets.rank = function (myTeam) {
   return scored.slice(0, apTargets.TOP_N);
 };
 
-apTargets.render = function () {
-  apTargets.layer.clearLayers();
+// compute() refreshes the cached ranked list. Called by both the layer (for badges)
+// and the on-demand panel (so the dialog can fetch fresh data when opened).
+apTargets.compute = function () {
   var myTeam = apTargets.getMyTeam();
   if (!myTeam) {
-    apTargets.setStatus([
-      'AP Targets v' + apTargets.VERSION,
-      'Faction not set. Reload to retry the prompt,',
-      'or set localStorage["' + apTargets.STORAGE_KEY + '"] to R / E / M.',
-    ]);
-    return;
+    apTargets._lastResult = { myTeam: null, top: [] };
+    return apTargets._lastResult;
   }
-  var top = apTargets.rank(myTeam);
-  if (top.length === 0) {
-    apTargets.setStatus(['AP Targets v' + apTargets.VERSION + ' (vs ' + myTeam + ')', '(no enemy portals in view)']);
-    return;
-  }
-  for (var i = 0; i < top.length; i++) {
-    var t = top[i];
+  apTargets._lastResult = { myTeam: myTeam, top: apTargets.rank(myTeam) };
+  return apTargets._lastResult;
+};
+
+apTargets.renderBadges = function () {
+  apTargets.layer.clearLayers();
+  var r = apTargets._lastResult || { top: [] };
+  for (var i = 0; i < r.top.length; i++) {
+    var t = r.top[i];
     L.marker(t.latLng, {
       icon: apTargets.makeBadge(i + 1, t.ap),
       interactive: false,
       keyboard: false,
     }).addTo(apTargets.layer);
   }
-  var lines = ['AP Targets v' + apTargets.VERSION + ' (vs ' + myTeam + ')'];
-  for (var j = 0; j < top.length; j++) {
-    var r = top[j];
-    var rankStr = '#' + (j + 1);
-    while (rankStr.length < 3) rankStr += ' ';
-    lines.push(rankStr + ' ' + r.ap + ' AP  (' + r.links + 'L ' + r.fields + 'F)  ' + r.title);
+};
+
+// render() is the per-event entry point: recompute + redraw badges + refresh the
+// dialog if it's currently open. Used by all the debounced hooks.
+apTargets.render = function () {
+  apTargets.compute();
+  apTargets.renderBadges();
+  apTargets._refreshPanel();
+};
+
+apTargets._panelHtml = function () {
+  var r = apTargets._lastResult || { myTeam: null, top: [] };
+  var html = '<div class="ap-targets-panel">';
+  html += '<div class="apt-meta">v' + apTargets.escapeHtml(apTargets.VERSION) + ' &middot; vs ' + (r.myTeam ? apTargets.escapeHtml(r.myTeam) : '<em>(faction not set)</em>') + '</div>';
+  if (!r.myTeam) {
+    html += '<p>Reload the page to retry the faction prompt, or set <code>localStorage["' + apTargets.escapeHtml(apTargets.STORAGE_KEY) + '"]</code> to <code>R</code>, <code>E</code>, or <code>M</code>.</p>';
+  } else if (r.top.length === 0) {
+    html += '<p>No enemy portals with incident links or fields in the current viewport.</p>';
+  } else {
+    html += '<table class="apt-table"><thead><tr>' +
+      '<th>#</th><th>AP</th><th>Links</th><th>Fields</th><th>Portal</th>' +
+      '</tr></thead><tbody>';
+    for (var i = 0; i < r.top.length; i++) {
+      var t = r.top[i];
+      var title = apTargets.escapeHtml(t.title);
+      if (!t.hasTitle) title = '<em>' + title + '</em>';
+      html += '<tr>' +
+        '<td>' + (i + 1) + '</td>' +
+        '<td>' + t.ap + '</td>' +
+        '<td>' + t.links + '</td>' +
+        '<td>' + t.fields + '</td>' +
+        '<td>' + title + '</td>' +
+      '</tr>';
+    }
+    html += '</tbody></table>';
   }
-  apTargets.setStatus(lines);
+  html += '</div>';
+  return html;
+};
+
+apTargets.openPanel = function () {
+  apTargets.compute();
+  window.dialog({
+    title: 'AP Targets',
+    id: 'plugin-ap-targets',
+    html: apTargets._panelHtml(),
+    width: 'auto',
+    closeCallback: function () { apTargets._dialogOpen = false; },
+  });
+  apTargets._dialogOpen = true;
+};
+
+apTargets._refreshPanel = function () {
+  if (!apTargets._dialogOpen) return;
+  var el = document.getElementById('plugin-ap-targets');
+  if (!el) { apTargets._dialogOpen = false; return; }
+  el.innerHTML = apTargets._panelHtml();
 };
 
 function setup() {
@@ -219,11 +258,19 @@ function setup() {
         clearTimeout(pendingTimer);
         pendingTimer = null;
       }
-      apTargets.removeStatus();
     });
 
-  // Name must be stable across releases — layerChooser persists enable state keyed by name.
+  // Layer chooser entry: toggles the on-map badges. Name must be stable across
+  // releases — layerChooser persists enable state keyed by name.
   window.layerChooser.addOverlay(apTargets.layer, 'AP Targets', { default: false });
+
+  // Toolbox entry: opens the on-demand panel regardless of layer state.
+  $('#toolbox').append(
+    $('<a>')
+      .text('AP Targets')
+      .attr('title', 'Show top enemy portals ranked by destruction AP')
+      .on('click', function (e) { e.preventDefault(); apTargets.openPanel(); })
+  );
 
   $('<style>')
     .html(
@@ -233,7 +280,15 @@ function setup() {
       'background:#c00;color:#fff;font:bold 12px/22px sans-serif;' +
       'border:1px solid #fff;box-shadow:0 0 0 1px #000;}' +
       '.ap-targets-ap{margin-top:2px;font:bold 10px/12px sans-serif;color:#fff;' +
-      'text-shadow:-1px -1px #000,1px -1px #000,-1px 1px #000,1px 1px #000;}'
+      'text-shadow:-1px -1px #000,1px -1px #000,-1px 1px #000,1px 1px #000;}' +
+      '.ap-targets-panel .apt-meta{font-size:11px;color:#888;margin-bottom:6px;}' +
+      '.ap-targets-panel .apt-table{border-collapse:collapse;width:100%;}' +
+      '.ap-targets-panel .apt-table th,.ap-targets-panel .apt-table td{padding:2px 8px;text-align:left;border-bottom:1px solid #333;}' +
+      '.ap-targets-panel .apt-table th{font-weight:bold;}' +
+      '.ap-targets-panel .apt-table td:nth-child(1),.ap-targets-panel .apt-table th:nth-child(1){text-align:right;width:2em;}' +
+      '.ap-targets-panel .apt-table td:nth-child(2),.ap-targets-panel .apt-table th:nth-child(2),' +
+      '.ap-targets-panel .apt-table td:nth-child(3),.ap-targets-panel .apt-table th:nth-child(3),' +
+      '.ap-targets-panel .apt-table td:nth-child(4),.ap-targets-panel .apt-table th:nth-child(4){text-align:right;}'
     )
     .appendTo('head');
 }
