@@ -164,21 +164,31 @@ tidyLinksReality.getUsedOutgoing = function () {
   return used;
 };
 
-// Draw an arrowhead (open V) at toLL pointing along fromLL->toLL. Solid red, no dash.
-tidyLinksReality.drawArrowHead = function (fromLL, toLL, layer) {
+// Draw a trail of small chevrons along fromLL->toLL, all pointing toward toLL.
+// Each chevron is ~6 px wide, 4 px deep. Chevrons are spaced every 30 px along the
+// segment, with a 20 px clearance from each endpoint so portal markers stay readable.
+tidyLinksReality.drawChevronTrail = function (fromLL, toLL, layer) {
   var fp = map.latLngToLayerPoint(fromLL);
   var tp = map.latLngToLayerPoint(toLL);
   var dx = tp.x - fp.x, dy = tp.y - fp.y;
   var len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 1) return;
+  var ENDPOINT_CLEARANCE = 20;
+  var SPACING = 30;
+  var CHEVRON_DEPTH = 4;
+  var CHEVRON_HALF = 3;
+  if (len <= 2 * ENDPOINT_CLEARANCE) return;
   var ux = dx / len, uy = dy / len;
-  var ARROW_LEN = 10, ARROW_HALF = 5;
-  var b1 = L.point(tp.x - ARROW_LEN * ux + ARROW_HALF * -uy, tp.y - ARROW_LEN * uy + ARROW_HALF * ux);
-  var b2 = L.point(tp.x - ARROW_LEN * ux - ARROW_HALF * -uy, tp.y - ARROW_LEN * uy - ARROW_HALF * ux);
-  L.polyline(
-    [map.layerPointToLatLng(b1), toLL, map.layerPointToLatLng(b2)],
-    { color: 'red', opacity: 1, weight: 1.5, interactive: false }
-  ).addTo(layer);
+  var nx = -uy, ny = ux;
+  for (var d = ENDPOINT_CLEARANCE; d <= len - ENDPOINT_CLEARANCE; d += SPACING) {
+    var tipX = fp.x + ux * d, tipY = fp.y + uy * d;
+    var armBaseX = tipX - ux * CHEVRON_DEPTH, armBaseY = tipY - uy * CHEVRON_DEPTH;
+    var a1 = L.point(armBaseX + nx * CHEVRON_HALF, armBaseY + ny * CHEVRON_HALF);
+    var a2 = L.point(armBaseX - nx * CHEVRON_HALF, armBaseY - ny * CHEVRON_HALF);
+    L.polyline(
+      [map.layerPointToLatLng(a1), map.layerPointToLatLng(L.point(tipX, tipY)), map.layerPointToLatLng(a2)],
+      { color: 'red', opacity: 1, weight: 1.5, interactive: false }
+    ).addTo(layer);
+  }
 };
 
 // Collect every live game link as a constraint edge in unrounded pixel space at PROJECT_ZOOM.
@@ -291,7 +301,7 @@ tidyLinksReality.draw = function (locations, layer, existing, usedOutgoing) {
     var fromLL = locations[origin].getLatLng();
     var toLL = locations[dest].getLatLng();
     L.polyline([fromLL, toLL], tidyLinksReality.STROKE_STYLE).addTo(layer);
-    tidyLinksReality.drawArrowHead(fromLL, toLL, layer);
+    tidyLinksReality.drawChevronTrail(fromLL, toLL, layer);
     free[origin]--;
     assigned[origin]++;
     drawnCount++;
