@@ -6,6 +6,8 @@ One layer shows both the links and an efficient walk to make them: portals withi
 
 `ap-targets.user.js`: top-10 enemy portals in viewport by destruction AP (187 per link + 750 per field touching). Numbered badges on map; full list in a dialog from the IITC toolbox.
 
+[gcj02-fix.user.js](https://github.com/ahxxm/iitc-plugins/raw/master/gcj02-fix.user.js): automatically applies in mainland China such that you see real portal locations on the up-to-date map, enable when using Gaode, disable when OSM otherwise double offset
+
 
 ## Known limitations
 
